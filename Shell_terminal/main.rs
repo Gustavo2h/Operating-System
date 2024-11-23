@@ -1,192 +1,134 @@
-use std::io::{self,Write};
-use std::process::{Command, Stdio};
-use nix::unistd::{fork, ForkResult};
-use nix::sys::wait::wait;
-
-use libc;
-
+use std::io::{self, Write};
+use nix::unistd::{fork, execvp, pipe, dup2, close, ForkResult};
+use nix::sys::wait::waitpid;
+use std::ffi::CString;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
-use nix::unistd::dup2;
-
-use nix::unistd::{pipe, close};
+use libc;
 
 const MAX_LINE: usize = 80;
 
 fn main() {
-	let mut should_run = true;
-	let mut args: Vec<&str> = Vec::with_capacity(MAX_LINE/2 + 1);	
-	let mut history : Vec<String> = Vec::new();
+    let mut should_run = true;
+    let mut history: Vec<String> = Vec::new();
 
-	while should_run{
+    while should_run {
+        print!("osh> ");
+        io::stdout().flush().expect("Falha no flush");
 
-		print!("osh> ");
-		io::stdout().flush().expect("Falha no flush");
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).expect("Falha ao ler entrada");
 
-		let mut input = String::new();
-		io::stdin().read_line(&mut input).expect("Falha ao ler");
-		
-		let mut input = input.trim();
+        let input = input.trim().to_string();
 
-		//arrumar o uso das funcoes
-		//talvez sumir com a funcao historySearch
-		if input=="exit" {
-			should_run = false;
-			continue;
-		}else if input == "!!"{
-			if historySearch(&history) == None{
-				continue;
-			}else{
-				input = &historySearch(&history).expect("falha no historico").to_string();
-			}
-		}else{
-			history.push(input.to_string());
-		}
+        if input == "exit" {
+            should_run = false;
+            continue;
+        } else if input == "!!" {
+            if let Some(last_command) = history.last() {
+                println!("{}", last_command);
+                history.push(last_command.clone());
+            } else {
+                eprintln!("Nenhum comando no histÃ³rico.");
+                continue;
+            }
+        } else {
+            history.push(input.clone());
+        }
 
-		for (i, arg) in input.split_whitespace().enumerate(){
-			if i < (MAX_LINE/2 + 1){
-				args.push(arg);
-			}else{
-				eprintln!("Maximo de argumentos excedido");
-				break;
-			}
-		}
+        let args: Vec<&str> = input.split_whitespace().collect();
 
-		if args.is_empty(){
-			continue;
-		}
+        if args.is_empty() {
+            continue;
+        }
 
-		if args.contains (&"|"){
-			let pipe_position = args.iter().position(|&r| r == "|").unwrap();
-			let cmd1 = &args[..pipe_position];
-			let cmd2 = &args[pipe_position+1..];
-			exePipe(cmd1, cmd2);
-		}else if args.contains(&">") || args.contains(&"<") {
-			let (command, file, isout);
-			
-			if let Some(position) = args.iter().position(|&r| r == ">"){
-				command = &args[..position];
-				file = &args[position+1];
-				isout = true;
-			}else if let Some(position) = args.iter().position(|&r| r=="<"){
-				command = &args[..position];
-				file = &args[position+1];
-				isout = false;
-			}else{
-				command = &args[..];
-				file = &"";
-				isout = true;
-			};
-			redirectionCommand(command,
-			if isout {None} else {Some(&file)}, 
-			if isout {Some(&file)} else {None});
-		}else {
-			let backg = args.last() == Some(&"&");
-			if backg {
-				args.pop();
-			}
-			newFork(args.clone(),backg);
-		}
-	}
+        if args.contains(&"|") {
+            let commands: Vec<&str> = input.split('|').map(|s| s.trim()).collect();
+            exe_pipeline(&commands);
+        } else if args.contains(&">") || args.contains(&"<") {
+            let position = args.iter().position(|&r| r == ">" || r == "<");
+            if let Some(pos) = position {
+                let (command, file, is_output) = if args[pos] == ">" {
+                    (&args[..pos], args[pos + 1], true)
+                } else {
+                    (&args[..pos], args[pos + 1], false)
+                };
+                redirection_command(command, file, is_output);
+            }
+        } else {
+            let background = args.last() == Some(&"&");
+            let command = if background { &args[..args.len() - 1] } else { &args };
+            new_fork(command.to_vec(), background);
+        }
+    }
 }
 
-fn newFork (args: Vec<&str>, backg: bool){
-
-	match unsafe {fork()} {
-		Ok (ForkResult::Child) => {
-			let exe_result = Command::new(args[0])
-			.args(&args[1..])
-			.stdin(Stdio::inherit())
-			.stdout(Stdio::inherit())
-			.stderr(Stdio::inherit())
-			.spawn();
-			if let Err(e) = exe_result{
-				eprintln!("Erro no Child: {}", e);
-				std::process::exit(1);
-			}
-		}
-		Ok (ForkResult::Parent { .. }) => {
-			if !backg{
-				wait().expect("Falha no Wait");
-			}
-		}
-		Err(_)=> eprintln!("Falha no fork"),
-	}
+fn new_fork(args: Vec<&str>, background: bool) {
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => {
+            let c_args: Vec<CString> = args.iter().map(|&arg| CString::new(arg).unwrap()).collect();
+            let c_args_ref: Vec<&CString> = c_args.iter().collect();
+            execvp(&c_args_ref[0], &c_args_ref).expect("Falha no execvp");
+        }
+        Ok(ForkResult::Parent { .. }) => {
+            if !background {
+                waitpid(None, None).expect("Falha no waitpid");
+            }
+        }
+        Err(_) => eprintln!("Falha no fork"),
+    }
 }
 
+fn redirection_command(command: &[&str], file: &str, is_output: bool) {
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => {
+            let fd = if is_output {
+                File::create(file).expect("Falha ao abrir arquivo de saÃ­da").as_raw_fd()
+            } else {
+                File::open(file).expect("Falha ao abrir arquivo de entrada").as_raw_fd()
+            };
 
-fn historySearch (history: &[String]) -> Option<String> {
-	if let Some(lcommand) = history.last(){
-		println!("{}", lcommand);
-		Some(lcommand.clone())
-	}else{
-		eprintln!("No commands in history.");
-		None
-	}
-
+            dup2(fd, if is_output { libc::STDOUT_FILENO } else { libc::STDIN_FILENO }).expect("Falha no dup2");
+            let c_args: Vec<CString> = command.iter().map(|&arg| CString::new(arg).unwrap()).collect();
+            let c_args_ref: Vec<&CString> = c_args.iter().collect();
+            execvp(&c_args_ref[0], &c_args_ref).expect("Falha no execvp");
+        }
+        Ok(ForkResult::Parent { .. }) => {
+            waitpid(None, None).expect("Falha no waitpid");
+        }
+        Err(_) => eprintln!("Falha no fork"),
+    }
 }
 
-fn redirectionCommand (args: &[&str], input: Option<&str>, output: Option<&str>){
+fn exe_pipeline(commands: &[&str]) {
+    let mut fds = Vec::new();
+    for _ in 0..commands.len() - 1 {
+        fds.push(pipe().expect("Falha ao criar pipe"));
+    }
 
-	match unsafe {fork()}{
-		Ok(ForkResult::Child)=>{
-			if let Some(inputf) = input{
-				let file = File::open(inputf).expect("Falha ao abrir input");
-				dup2(file.as_raw_fd(), libc::STDIN_FILENO).expect("Falha no dup2");
-			}
-			if let Some(outputf) = output{
-				let file = File::create(outputf).expect("Falha ao abrir output");
-				dup2(file.as_raw_fd(), libc::STDOUT_FILENO).expect("Falha no dup2");
-			}
-			let exe_result = Command::new(args[0])
-			.args(&args[1..])
-			.stdin(Stdio::inherit())
-			.stdout(Stdio::inherit())
-			.stderr(Stdio::inherit())
-			.spawn();
-			if let Err(e) = exe_result{
-				eprintln!("Erro: {}", e);
-				std::process::exit(1);
-			}
-		}
-		Ok (ForkResult::Parent { .. })=>{
-			wait().expect("Falha no wait");
-		}
-		Err(_) => eprintln!("Falha no fork"),
-	}
-}
-
-fn exePipe (cmd1:&[&str], cmd2:&[&str]){
-
-	let (pipe_read, pipe_write) = pipe().expect("Falha ao criar pipe");
-	
-	match unsafe {fork()} {
-		Ok(ForkResult::Child) => {
-			match unsafe {fork()}{
-				Ok(ForkResult::Child) =>{
-					close(pipe_read.as_raw_fd()).expect("Falha ao fechar pipe_read");
-					dup2(pipe_write, libc::STDOUT_FILENO)
-					.expect("Falha no dup2");
-					Command::new(cmd1[0])
-					.args(&cmd1[1..])
-					.spawn()
-					.expect("Falha no cmd1");
-				}
-				Ok(ForkResult::Parent{ .. }) => {
-					close(pipe_write.as_raw_fd()).expect("Falha ao fechar pipe_write");
-					dup2(pipe_read, libc::STDIN_FILENO)
-					.expect("Falha no dup2");
-					Command::new(cmd2[0])
-					.args(&cmd2[1..])
-					.spawn()
-					.expect("Falha no cmd2");
-				}
-			Err(_) => eprintln!("Falha no fork de dentro"),
-			}
-		}
-		Ok(ForkResult::Parent{..}) => {
-			wait().expect("Falha no wait");
-		}
-	Err(_) => eprintln!("Falha no fork de fora"),
-	}
+    for (i, cmd) in commands.iter().enumerate() {
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                if i > 0 {
+                    close(fds[i - 1].1).expect("Falha ao fechar pipe de escrita");
+                    dup2(fds[i - 1].0, libc::STDIN_FILENO).expect("Falha no dup2 para stdin");
+                }
+                if i < commands.len() - 1 {
+                    close(fds[i].0).expect("Falha ao fechar pipe de leitura");
+                    dup2(fds[i].1, libc::STDOUT_FILENO).expect("Falha no dup2 para stdout");
+                }
+                let args: Vec<CString> = cmd.split_whitespace().map(|arg| CString::new(arg).unwrap()).collect();
+                let c_args_ref: Vec<&CString> = args.iter().collect();
+                execvp(&c_args_ref[0], &c_args_ref).expect("Falha no execvp");
+            }
+            Ok(ForkResult::Parent { .. }) => {
+                if i > 0 {
+                    close(fds[i - 1].0).expect("Falha ao fechar pipe de leitura no pai");
+                    close(fds[i - 1].1).expect("Falha ao fechar pipe de escrita no pai");
+                }
+                waitpid(None, None).expect("Falha no waitpid");
+            }
+            Err(_) => eprintln!("Falha no fork"),
+        }
+    }
 }
