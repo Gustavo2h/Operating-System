@@ -7,6 +7,9 @@ use std::os::unix::io::AsRawFd;
 use libc;
 
 const MAX_LINE: usize = 80;
+//Falta limitar o tamanho da entrada
+//O redirecionamento nao esta funcionando (erro no dup2)
+//Pipe, comando simples e historico funcionando
 
 fn main() {
     let mut should_run = true;
@@ -19,7 +22,7 @@ fn main() {
         let mut input = String::new();
         io::stdin().read_line(&mut input).expect("Falha ao ler entrada");
 
-        let input = input.trim().to_string();
+        let mut input = input.trim().to_string(); // Aqui, tornamos input mutável
 
         if input == "exit" {
             should_run = false;
@@ -27,14 +30,14 @@ fn main() {
         } else if input == "!!" {
             if let Some(last_command) = history.last() {
                 println!("{}", last_command);
-                history.push(last_command.clone());
+                input = last_command.clone(); // Agora podemos reatribuir um novo valor a input
             } else {
-                eprintln!("Nenhum comando no histÃ³rico.");
+                eprintln!("Nenhum comando no histórico.");
                 continue;
             }
-        } else {
-            history.push(input.clone());
         }
+
+        history.push(input.clone());
 
         let args: Vec<&str> = input.split_whitespace().collect();
 
@@ -83,12 +86,13 @@ fn redirection_command(command: &[&str], file: &str, is_output: bool) {
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
             let fd = if is_output {
-                File::create(file).expect("Falha ao abrir arquivo de saÃ­da").as_raw_fd()
+                File::create(file).expect("Falha ao abrir arquivo de saída").as_raw_fd()
             } else {
                 File::open(file).expect("Falha ao abrir arquivo de entrada").as_raw_fd()
             };
 
             dup2(fd, if is_output { libc::STDOUT_FILENO } else { libc::STDIN_FILENO }).expect("Falha no dup2");
+            close(fd).expect("Falha ao fechar o arquivo");  // Certifique-se de fechar o arquivo
             let c_args: Vec<CString> = command.iter().map(|&arg| CString::new(arg).unwrap()).collect();
             let c_args_ref: Vec<&CString> = c_args.iter().collect();
             execvp(&c_args_ref[0], &c_args_ref).expect("Falha no execvp");
