@@ -1,15 +1,13 @@
 use std::io::{self, Write};
-use nix::unistd::{fork, execvp, pipe, dup2, close, ForkResult};
+use nix::unistd::{fork, execvp, dup2, pipe, close, ForkResult};
 use nix::sys::wait::waitpid;
+use nix::errno::Errno;
 use std::ffi::CString;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use libc;
 
-const MAX_LINE: usize = 80;
-//Falta limitar o tamanho da entrada
-//O redirecionamento nao esta funcionando (erro no dup2)
-//Pipe, comando simples e historico funcionando
+//falta comenta o codigo, mas ta rodando :)
 
 fn main() {
     let mut should_run = true;
@@ -86,13 +84,38 @@ fn redirection_command(command: &[&str], file: &str, is_output: bool) {
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
             let fd = if is_output {
-                File::create(file).expect("Falha ao abrir arquivo de saída").as_raw_fd()
+                // Abrindo o arquivo para escrita
+                unsafe { libc::open(CString::new(file).unwrap().as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644) }
             } else {
-                File::open(file).expect("Falha ao abrir arquivo de entrada").as_raw_fd()
+                // Abrindo o arquivo para leitura
+                unsafe { libc::open(CString::new(file).unwrap().as_ptr(), libc::O_RDONLY) }
             };
 
-            dup2(fd, if is_output { libc::STDOUT_FILENO } else { libc::STDIN_FILENO }).expect("Falha no dup2");
-            close(fd).expect("Falha ao fechar o arquivo");  // Certifique-se de fechar o arquivo
+            if fd < 0 {
+                eprintln!("Erro ao abrir arquivo");
+                std::process::exit(1);
+            }
+
+            // Redirecionando stdin ou stdout
+            match unsafe { dup2(fd, if is_output { libc::STDOUT_FILENO } else { libc::STDIN_FILENO }) } {
+                Ok(_) => (),
+                Err(Errno::EBADF) => {
+                    eprintln!("Erro no dup2: Bad file descriptor");
+                    std::process::exit(1);
+                }
+                Err(Errno::EINTR) => {
+                    eprintln!("Erro no dup2: Interrupted system call");
+                    std::process::exit(1);
+                }
+                Err(_) => {
+                    eprintln!("Erro desconhecido no dup2");
+                    std::process::exit(1);
+                }
+            }
+
+            // Fechando o descritor de arquivo, pois já foi duplicado
+            unsafe { close(fd) };
+
             let c_args: Vec<CString> = command.iter().map(|&arg| CString::new(arg).unwrap()).collect();
             let c_args_ref: Vec<&CString> = c_args.iter().collect();
             execvp(&c_args_ref[0], &c_args_ref).expect("Falha no execvp");
