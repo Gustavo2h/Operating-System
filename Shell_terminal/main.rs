@@ -3,63 +3,66 @@ use nix::unistd::{fork, execvp, dup2, pipe, close, ForkResult};
 use nix::sys::wait::waitpid;
 use nix::errno::Errno;
 use std::ffi::CString;
-use std::fs::File;
-use std::os::unix::io::AsRawFd;
 use libc;
-
-//falta comenta o codigo, mas ta rodando :)
 
 fn main() {
     let mut should_run = true;
-    let mut history: Vec<String> = Vec::new();
+    let mut history: Vec<String> = Vec::new(); //historico
 
     while should_run {
         print!("osh> ");
         io::stdout().flush().expect("Falha no flush");
 
-        let mut input = String::new();
+        let mut input = String::new(); //string de entrada
         io::stdin().read_line(&mut input).expect("Falha ao ler entrada");
 
-        let mut input = input.trim().to_string(); // Aqui, tornamos input mutável
+        let mut input = input.trim().to_string(); // remove os espaços em branco (inicio e fim)
+
+        // limita entrada a 80 caracteres
+        if input.len() > 80 {
+            input.truncate(80);
+            eprintln!("Entrada maior que 80 caracteres.");
+        }
 
         if input == "exit" {
             should_run = false;
             continue;
         } else if input == "!!" {
-            if let Some(last_command) = history.last() {
+            if let Some(last_command) = history.last() { //verificação do historico
                 println!("{}", last_command);
-                input = last_command.clone(); // Agora podemos reatribuir um novo valor a input
+                input = last_command.clone();
             } else {
                 eprintln!("Nenhum comando no histórico.");
                 continue;
             }
         }
 
-        history.push(input.clone());
+        history.push(input.clone()); //atualiza o historico
 
-        let args: Vec<&str> = input.split_whitespace().collect();
+        let args: Vec<&str> = input.split_whitespace().collect(); //criando vetor de argumentos pra usar o execvp
 
         if args.is_empty() {
             continue;
         }
 
-        if args.contains(&"|") {
+        let background = args.last() == Some(&"&"); //background = 1 se tiver '&'
+        let command = if background { &args[..args.len() - 1] } else { &args };
+
+        if args.contains(&"|") { //caso do pipe
             let commands: Vec<&str> = input.split('|').map(|s| s.trim()).collect();
-            exe_pipeline(&commands);
-        } else if args.contains(&">") || args.contains(&"<") {
+            exe_pipeline(&commands, background);
+        } else if args.contains(&">") || args.contains(&"<") { //caso do redirecionamento
             let position = args.iter().position(|&r| r == ">" || r == "<");
             if let Some(pos) = position {
-                let (command, file, is_output) = if args[pos] == ">" {
-                    (&args[..pos], args[pos + 1], true)
+                let (cmd, file, is_output) = if args[pos] == ">" {
+                    (&command[..pos], args[pos + 1], true)
                 } else {
-                    (&args[..pos], args[pos + 1], false)
+                    (&command[..pos], args[pos + 1], false)
                 };
-                redirection_command(command, file, is_output);
+                redirection_command(cmd, file, is_output, background);
             }
         } else {
-            let background = args.last() == Some(&"&");
-            let command = if background { &args[..args.len() - 1] } else { &args };
-            new_fork(command.to_vec(), background);
+            new_fork(command.to_vec(), background); //comando basico
         }
     }
 }
@@ -80,14 +83,12 @@ fn new_fork(args: Vec<&str>, background: bool) {
     }
 }
 
-fn redirection_command(command: &[&str], file: &str, is_output: bool) {
+fn redirection_command(command: &[&str], file: &str, is_output: bool, background: bool) {
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
             let fd = if is_output {
-                // Abrindo o arquivo para escrita
                 unsafe { libc::open(CString::new(file).unwrap().as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644) }
             } else {
-                // Abrindo o arquivo para leitura
                 unsafe { libc::open(CString::new(file).unwrap().as_ptr(), libc::O_RDONLY) }
             };
 
@@ -96,24 +97,7 @@ fn redirection_command(command: &[&str], file: &str, is_output: bool) {
                 std::process::exit(1);
             }
 
-            // Redirecionando stdin ou stdout
-            match unsafe { dup2(fd, if is_output { libc::STDOUT_FILENO } else { libc::STDIN_FILENO }) } {
-                Ok(_) => (),
-                Err(Errno::EBADF) => {
-                    eprintln!("Erro no dup2: Bad file descriptor");
-                    std::process::exit(1);
-                }
-                Err(Errno::EINTR) => {
-                    eprintln!("Erro no dup2: Interrupted system call");
-                    std::process::exit(1);
-                }
-                Err(_) => {
-                    eprintln!("Erro desconhecido no dup2");
-                    std::process::exit(1);
-                }
-            }
-
-            // Fechando o descritor de arquivo, pois já foi duplicado
+            dup2(fd, if is_output { libc::STDOUT_FILENO } else { libc::STDIN_FILENO }).expect("Falha no dup2");
             unsafe { close(fd) };
 
             let c_args: Vec<CString> = command.iter().map(|&arg| CString::new(arg).unwrap()).collect();
@@ -121,13 +105,15 @@ fn redirection_command(command: &[&str], file: &str, is_output: bool) {
             execvp(&c_args_ref[0], &c_args_ref).expect("Falha no execvp");
         }
         Ok(ForkResult::Parent { .. }) => {
-            waitpid(None, None).expect("Falha no waitpid");
+            if !background {
+                waitpid(None, None).expect("Falha no waitpid");
+            }
         }
         Err(_) => eprintln!("Falha no fork"),
     }
 }
 
-fn exe_pipeline(commands: &[&str]) {
+fn exe_pipeline(commands: &[&str], background: bool) {
     let mut fds = Vec::new();
     for _ in 0..commands.len() - 1 {
         fds.push(pipe().expect("Falha ao criar pipe"));
@@ -153,7 +139,9 @@ fn exe_pipeline(commands: &[&str]) {
                     close(fds[i - 1].0).expect("Falha ao fechar pipe de leitura no pai");
                     close(fds[i - 1].1).expect("Falha ao fechar pipe de escrita no pai");
                 }
-                waitpid(None, None).expect("Falha no waitpid");
+                if !background {
+                    waitpid(None, None).expect("Falha no waitpid");
+                }
             }
             Err(_) => eprintln!("Falha no fork"),
         }
